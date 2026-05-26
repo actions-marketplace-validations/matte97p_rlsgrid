@@ -1,9 +1,5 @@
 name: rlsgrid
-description: >-
-  Schema-driven Row-Level Security audit and cross-tenant fuzz for Postgres
-  and Supabase. Reads your live schema, classifies every role × table × op
-  cell, and (optionally) probes for cross-tenant leaks. Posts a JSON report
-  the next step can act on.
+description: Schema-driven RLS audit and cross-tenant fuzz for Postgres/Supabase. Runs in CI, fails on cross-tenant leaks.
 author: matte97p
 branding:
   icon: shield
