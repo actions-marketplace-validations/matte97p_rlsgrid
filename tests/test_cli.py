@@ -31,6 +31,14 @@ def test_init_writes_config(tmp_path: Path) -> None:
     assert "[connection]" in out.read_text()
 
 
+def test_init_creates_missing_parent_dirs(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out = tmp_path / "backend" / "rls" / "rlsgrid.toml"
+    result = runner.invoke(main, ["init", "--out", str(out)])
+    assert result.exit_code == 0
+    assert out.exists()
+
+
 def test_missing_config_exits_2(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["introspect", "--config", str(tmp_path / "nope.toml")])

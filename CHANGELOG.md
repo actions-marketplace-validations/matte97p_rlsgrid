@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-27
+
+### Fixed
+- `init --out path/in/missing/dirs.toml` (and `init --from-db`) now creates
+  the parent directories instead of crashing with a `FileNotFoundError`
+  traceback — matching `gen pgtap`'s behaviour.
+
 ## [0.3.0] — 2026-05-27
 
 ### Added

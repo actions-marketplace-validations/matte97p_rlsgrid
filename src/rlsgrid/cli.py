@@ -112,6 +112,8 @@ def init(out_path: str, force: bool, from_db: bool, probe_config: str | None) ->
     if path.exists() and not force:
         console.print(f"[yellow]{path} already exists.[/yellow] Pass --force to overwrite.")
         sys.exit(1)
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
 
     if not from_db:
         path.write_text(DEFAULT_CONFIG_TEMPLATE)
