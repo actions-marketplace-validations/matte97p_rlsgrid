@@ -147,12 +147,31 @@ def seed_tenants(
 
     tenant_column = config.tenancy.tenant_column
     user_id_column = config.tenancy.user_id_column
-    seedable = [
-        t
+
+    # The tenant root table keys the tenant on its own PK and is referenced by
+    # children through `tenant_column` (e.g. orgs.id ← projects.org_id). It does
+    # not carry tenant_column itself, so it must be detected via the FK graph
+    # and seeded first, otherwise every child INSERT fails its FK to the root.
+    tenant_root = _detect_tenant_root(introspection, tenant_column)
+
+    seedable_set = {
+        t.qualified: t
         for t in introspection.rls_enabled_tables()
         if introspection.has_column(t.schema, t.name, tenant_column)
-    ]
-    ordered = topological_sort(seedable, introspection)
+    }
+    if tenant_root is not None:
+        root_schema, root_table, _root_col = tenant_root
+        root_info = next(
+            (
+                t
+                for t in introspection.tables
+                if t.schema == root_schema and t.name == root_table
+            ),
+            None,
+        )
+        if root_info is not None:
+            seedable_set.setdefault(root_info.qualified, root_info)
+    ordered = topological_sort(list(seedable_set.values()), introspection)
 
     report = SeedReport(tenant_column=tenant_column)
     report.check_warnings = [
@@ -172,6 +191,7 @@ def seed_tenants(
                     tenant=tenant,
                     tenant_column=tenant_column,
                     user_id_column=user_id_column,
+                    tenant_root=tenant_root,
                 )
                 if row is not None:
                     tenant.rows_by_table.setdefault(row.qualified_table, []).append(row)
@@ -180,6 +200,22 @@ def seed_tenants(
             report.tenants.append(tenant)
     report.skipped = sorted(skip_acc.items())
     return report
+
+
+def _detect_tenant_root(
+    introspection: IntrospectionResult,
+    tenant_column: str,
+) -> tuple[str, str, str] | None:
+    """Find the table the tenant column points at via a foreign key.
+
+    Returns (schema, table, referenced_column) for the first FK whose
+    referencing column is `tenant_column`, or None if tenant_column is a
+    free-standing value (no FK — e.g. the blog example's author_id).
+    """
+    for fk in introspection.foreign_keys:
+        if fk.column == tenant_column:
+            return (fk.ref_schema, fk.ref_table, fk.ref_column)
+    return None
 
 
 def topological_sort(
@@ -233,16 +269,27 @@ def _insert_row(
     tenant: SeededTenant,
     tenant_column: str,
     user_id_column: str,
+    tenant_root: tuple[str, str, str] | None = None,
 ) -> tuple[SeededRow | None, str | None]:
     """Return (row, skip_reason). At most one of the two is non-None."""
     columns = introspection.columns_of(table.schema, table.name)
     fks_by_col = {fk.column: fk for fk in introspection.foreign_keys_of(table.schema, table.name)}
     pk = introspection.pk_of(table.schema, table.name)
 
+    # If this is the tenant root table, the column children reference must be
+    # stamped with the tenant id so child FKs resolve.
+    root_col = None
+    if tenant_root is not None and (table.schema, table.name) == (tenant_root[0], tenant_root[1]):
+        root_col = tenant_root[2]
+
     insert_columns: list[str] = []
     insert_values: list[object] = []
 
     for column in columns:
+        if root_col is not None and column.name == root_col:
+            insert_columns.append(column.name)
+            insert_values.append(tenant.tenant_id)
+            continue
         value = _resolve_value(
             column,
             fks_by_col=fks_by_col,

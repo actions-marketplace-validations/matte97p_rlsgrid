@@ -67,6 +67,7 @@ class IntrospectionResult:
     primary_keys: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
     enum_labels: dict[str, list[str]] = field(default_factory=dict)
     tables_with_checks: set[tuple[str, str]] = field(default_factory=set)
+    grants: set[tuple[str, str, str, str]] = field(default_factory=set)  # (grantee, schema, table, privilege)
 
     def policies_for(self, schema: str, table: str) -> list[PolicyInfo]:
         return [p for p in self.policies if p.schema == schema and p.table == table]
@@ -94,6 +95,20 @@ class IntrospectionResult:
 
     def labels_for_enum(self, type_name: str) -> list[str] | None:
         return self.enum_labels.get(type_name)
+
+    def has_grant(self, role: str, schema: str, table: str, operation: str) -> bool:
+        """True if `role` (directly or via PUBLIC) is granted `operation`.
+
+        Does not resolve role inheritance — only direct grants and PUBLIC.
+        Good enough to distinguish a privilege-deny (throws 42501) from an
+        RLS-deny (silently returns/affects zero rows).
+        """
+        return (role, schema, table, operation) in self.grants or (
+            "PUBLIC",
+            schema,
+            table,
+            operation,
+        ) in self.grants
 
 
 _TABLE_QUERY = """
@@ -205,6 +220,13 @@ WHERE con.contype = 'c'
   AND NOT (n.nspname = ANY(%s))
 """
 
+_GRANT_QUERY = """
+SELECT grantee, table_schema, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+  AND NOT (table_schema = ANY(%s))
+"""
+
 
 def introspect(config: Config) -> IntrospectionResult:
     """Connect to the configured DB and dump RLS-relevant metadata."""
@@ -302,6 +324,13 @@ def introspect(config: Config) -> IntrospectionResult:
             if _is_excluded_table(schema, table, config):
                 continue
             result.tables_with_checks.add((schema, table))
+
+        cur.execute(_GRANT_QUERY, (exclude_schemas,))
+        for row in cur.fetchall():
+            grantee, schema, table, privilege = row
+            if _is_excluded_table(schema, table, config):
+                continue
+            result.grants.add((grantee, schema, table, privilege))
 
     return result
 

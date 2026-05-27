@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-27
+
+Correctness pass driven by running the full pipeline against a rich
+multi-tenant schema (FK chains, composite PKs, enums, CHECK constraints,
+a no-RLS table, a service-role-only table). Several bugs that the toy
+example schema could never surface are fixed here.
+
+### Fixed
+- **Tenant-root seeding.** When the tenant is keyed on a root table's own PK
+  and children reference it through `tenant_column` (e.g. `orgs.id` ←
+  `projects.org_id`), the seeder previously skipped the root table and every
+  child INSERT failed its foreign key — producing zero seeded rows and a
+  false "no breach" fuzz result. The seeder now detects the root table via
+  the FK graph and seeds it first.
+- **pgTAP probes asserted the wrong thing.** RLS denial is silent (zero rows),
+  not a `42501`, so the old `throws_ok` assertions failed for the wrong
+  reason. Base probes are now grant-aware: a missing privilege asserts
+  `throws_ok('42501')`, an RLS-denied-but-granted SELECT asserts
+  `is(count, 0)`, and an allowed SELECT asserts `lives_ok`.
+- **Invalid UPDATE probe.** The UPDATE probe used `SET ctid = ctid`, which
+  Postgres rejects (`cannot assign to system column`). It now self-assigns a
+  real primary-key column.
+- **CONDITIONAL SELECT on the root table.** The cross-tenant SELECT assertion
+  assumed every table carries `tenant_column`; it now identifies the target's
+  rows by their seeded primary keys, which also works for the root table.
+
+### Added
+- GRANT introspection (`information_schema.role_table_grants`) so the matrix
+  and pgTAP emitter can tell a privilege denial apart from an RLS denial.
+- Rich multi-tenant example under `examples/multitenant/` exercised end to
+  end in CI.
+
+### Changed
+- Cross-tenant INSERT coverage moved entirely to the runtime fuzz (which can
+  build a fully valid row); the static pgTAP suite no longer emits INSERT
+  CONDITIONAL probes.
+
+## [0.1.0 addendum]
+
 ### Added
 - GitHub Action `matte97p/rlsgrid@v1` lives in this repo (was previously a
   separate `matte97p/rlsgrid-action` repo, now archived). Composite action

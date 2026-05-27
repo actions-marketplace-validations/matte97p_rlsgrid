@@ -1,0 +1,30 @@
+# rlsgrid config for the rich multi-tenant example (examples/multitenant/schema.sql)
+
+[connection]
+url = "env:DATABASE_URL"
+schema_search_path = ["public"]
+
+[tenancy]
+mode = "jwt"
+tenant_column = "org_id"
+user_id_column = "user_id"
+auth_function = "auth.uid()"
+jwt_shape = "json"
+jwt_claims = { sub = "{user_id}", org_id = "{tenant_id}", role = "authenticated" }
+
+[roles]
+authenticated = "logged-in member of one org"
+anon = "public unauthenticated"
+service_role = "backend bypass — should never reach the browser"
+
+[fuzz]
+iterations = 300
+seed = 42
+stop_on_first_breach = false
+
+[exclude]
+schemas = ["pg_catalog", "information_schema", "auth"]
+tables = []
+
+[safety]
+forbid_url_patterns = ["prod", "production"]

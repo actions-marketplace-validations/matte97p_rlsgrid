@@ -56,6 +56,24 @@ jobs:
             --shields-out /tmp/badge.json --badge-out /tmp/badge.svg
           test -s /tmp/badge.json && test -s /tmp/badge.svg
           rlsgrid teardown --config examples/rlsgrid.toml --state /tmp/seed-state.json
+      - name: Smoke test against the rich multi-tenant schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rlsgrid_mt
+        run: |
+          psql "postgresql://postgres:postgres@localhost:5432/postgres" -c 'CREATE DATABASE rlsgrid_mt;'
+          psql "$DATABASE_URL" -f examples/multitenant/schema.sql
+          rlsgrid introspect --config examples/multitenant/rlsgrid.toml
+          rlsgrid plan --config examples/multitenant/rlsgrid.toml --json > /tmp/mt-plan.json
+          test -s /tmp/mt-plan.json
+          # Seed must produce rows on the FK-chained schema (regression guard for
+          # the tenant-root seeding bug fixed in 0.1.1).
+          rlsgrid seed --config examples/multitenant/rlsgrid.toml --tenants 3 --state-out /tmp/mt-seed.json --json > /tmp/mt-seed-out.json
+          python -c "import json; d=json.load(open('/tmp/mt-seed-out.json')); rows=sum(sum(t['rows_per_table'].values()) for t in d['tenants']); print('seeded rows:', rows); assert rows >= 12, 'tenant-root seeding regressed'"
+          rlsgrid gen pgtap --config examples/multitenant/rlsgrid.toml --from-state /tmp/mt-seed.json --out /tmp/mt-gen.sql
+          grep -qv ctid /tmp/mt-gen.sql
+          ! grep -q 'SET ctid' /tmp/mt-gen.sql
+          rlsgrid fuzz --config examples/multitenant/rlsgrid.toml --tenants 3
+          rlsgrid teardown --config examples/multitenant/rlsgrid.toml --state /tmp/mt-seed.json
 
   action-smoke:
     runs-on: ubuntu-latest
