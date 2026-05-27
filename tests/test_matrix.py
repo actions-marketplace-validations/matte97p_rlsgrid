@@ -76,6 +76,41 @@ def test_conditional_when_policy_has_qual() -> None:
     assert select_cell.expected is Expected.CONDITIONAL
 
 
+def test_rls_off_but_no_grant_is_deny_not_unrestricted() -> None:
+    # The common Supabase case: RLS disabled, but anon/authenticated were never
+    # granted access. Must NOT be flagged UNRESTRICTED (false alarm).
+    intro = IntrospectionResult(
+        tables=[TableInfo(schema="public", name="secrets", rls_enabled=False, rls_forced=False)],
+        grants={("service_role", "public", "secrets", op) for op in ("SELECT", "INSERT", "UPDATE", "DELETE")},
+    )
+    cells = build_matrix(intro, _config())
+    anon = next(c for c in cells if c.role == "anon" and c.operation == "SELECT")
+    svc = next(c for c in cells if c.role == "service_role" and c.operation == "SELECT")
+    assert anon.expected is Expected.DENY  # no grant → not an exposure
+    assert svc.expected is Expected.UNRESTRICTED  # bypass + granted
+
+
+def test_rls_off_with_grant_is_unrestricted() -> None:
+    intro = IntrospectionResult(
+        tables=[TableInfo(schema="public", name="open", rls_enabled=False, rls_forced=False)],
+        grants={("authenticated", "public", "open", "SELECT")},
+    )
+    cells = build_matrix(intro, _config())
+    auth_sel = next(c for c in cells if c.role == "authenticated" and c.operation == "SELECT")
+    auth_ins = next(c for c in cells if c.role == "authenticated" and c.operation == "INSERT")
+    assert auth_sel.expected is Expected.UNRESTRICTED  # granted + RLS off = real exposure
+    assert auth_ins.expected is Expected.DENY  # not granted INSERT
+
+
+def test_no_grants_known_falls_back_to_rls_only() -> None:
+    # When grants were not introspected, behave as before (assume granted).
+    intro = IntrospectionResult(
+        tables=[TableInfo(schema="public", name="t", rls_enabled=False, rls_forced=False)],
+    )
+    cells = build_matrix(intro, _config())
+    assert all(c.expected is Expected.UNRESTRICTED for c in cells)
+
+
 def test_service_role_bypasses_unless_forced() -> None:
     intro = IntrospectionResult(
         tables=[

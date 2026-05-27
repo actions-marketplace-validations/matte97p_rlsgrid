@@ -39,8 +39,13 @@ def build_matrix(
 ) -> list[MatrixCell]:
     """Walk every (role, table, operation) and classify expected outcome.
 
-    Rules:
-    - If RLS is not enabled on the table → UNRESTRICTED (no isolation at DB level).
+    Rules (in order):
+    - If table privileges were introspected and the role has no grant for the
+      operation → DENY. Without the privilege the role cannot touch the table
+      regardless of RLS, so flagging it UNRESTRICTED would be a false alarm
+      (the common Supabase case: RLS off but grants withheld from anon).
+    - If RLS is not enabled (and the role IS granted) → UNRESTRICTED — a real
+      exposure at the DB level.
     - If RLS is enabled but no permissive policy applies to (role, command) → DENY.
     - If at least one permissive policy applies and has no USING expression → ALLOW.
     - Otherwise → CONDITIONAL (policy gates which rows; runtime check needed).
@@ -50,11 +55,19 @@ def build_matrix(
     """
     cells: list[MatrixCell] = []
     role_entries = config.roles.roles or {"authenticated": "default"}
+    grants_known = bool(introspection.grants)
 
     for table in introspection.tables:
         for role, purpose in role_entries.items():
             for op in OPERATIONS:
-                expected, applicable = _classify(table, role, op, introspection.policies_for(table.schema, table.name))
+                expected, applicable = _classify(
+                    table,
+                    role,
+                    op,
+                    introspection.policies_for(table.schema, table.name),
+                    introspection,
+                    grants_known,
+                )
                 cells.append(
                     MatrixCell(
                         role=role,
@@ -74,7 +87,18 @@ def _classify(
     role: str,
     operation: str,
     policies: list[PolicyInfo],
+    introspection: IntrospectionResult,
+    grants_known: bool,
 ) -> tuple[Expected, list[PolicyInfo]]:
+    if (
+        grants_known
+        and not _is_bypass_role(role)
+        and not introspection.has_grant(role, table.schema, table.name, operation)
+    ):
+        # No table privilege → the role cannot perform the operation at all,
+        # so RLS state is moot. Not an exposure.
+        return Expected.DENY, []
+
     if not table.rls_enabled:
         return Expected.UNRESTRICTED, []
 

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-27
+
+Both improvements were surfaced by dogfooding rlsgrid against the real
+GeoSuite Supabase schema.
+
+### Added
+- **Grant-aware matrix.** `plan` now folds table privileges into the
+  classification: a table with RLS disabled but no grant to a public role is
+  `deny` (the role cannot touch it), not `unrestricted`. Previously every
+  RLS-off table — the common Supabase case where grants are withheld from
+  `anon`/`authenticated` and the backend uses `service_role` — was flagged
+  `unrestricted`, a false alarm. `unrestricted` is now reserved for the real
+  exposure: RLS off **and** a public role is granted. Falls back to the old
+  RLS-only behaviour when privileges were not introspected.
+- **External foreign-key seeding.** The seeder now seeds a minimal row in a
+  referenced table that lives outside the seedable set — most importantly
+  `auth.users`, which tenant tables routinely reference
+  (`accounts.owner_user_id → auth.users.id`). Without this the whole seed
+  chain failed its first foreign key and produced zero rows. The synthetic
+  rows are tracked so teardown (and `check`'s auto-cleanup) removes them too.
+
 ## [0.3.1] — 2026-05-27
 
 ### Fixed

@@ -255,11 +255,13 @@ def seed_tenants(
         t.qualified for t in ordered if introspection.has_check_constraints(t.schema, t.name)
     ]
 
+    seedable_qualified = {t.qualified for t in ordered}
     skip_acc: dict[str, str] = {}
     with psycopg.connect(config.connection.url) as conn:
         conn.autocommit = True
         for _ in range(tenants):
             tenant = SeededTenant(tenant_id=str(uuid.uuid4()), user_id=str(uuid.uuid4()))
+            external_refs: dict[tuple[str, str], tuple[str, object]] = {}
             for table in ordered:
                 row, reason = _insert_row(
                     conn,
@@ -269,11 +271,21 @@ def seed_tenants(
                     tenant_column=tenant_column,
                     user_id_column=user_id_column,
                     tenant_root=tenant_root,
+                    seedable_qualified=seedable_qualified,
+                    external_refs=external_refs,
                 )
                 if row is not None:
                     tenant.rows_by_table.setdefault(row.qualified_table, []).append(row)
                 elif reason:
                     skip_acc.setdefault(table.qualified, reason)
+            # Record on-demand external rows (e.g. auth.users) so teardown
+            # removes them too. They are parents, so they land before their
+            # children only in value; teardown deletes children-first by
+            # reverse insertion order.
+            for (rs, rt), (rcol, rval) in external_refs.items():
+                tenant.rows_by_table.setdefault(f"{rs}.{rt}", []).append(
+                    SeededRow(schema=rs, table=rt, pk_columns=(rcol,), full_row={rcol: rval})
+                )
             report.tenants.append(tenant)
     report.skipped = sorted(skip_acc.items())
     return report
@@ -377,11 +389,15 @@ def _insert_row(
     tenant_column: str,
     user_id_column: str,
     tenant_root: tuple[str, str, str] | None = None,
+    seedable_qualified: set[str] | None = None,
+    external_refs: dict[tuple[str, str], object] | None = None,
 ) -> tuple[SeededRow | None, str | None]:
     """Return (row, skip_reason). At most one of the two is non-None."""
     columns = introspection.columns_of(table.schema, table.name)
     fks_by_col = {fk.column: fk for fk in introspection.foreign_keys_of(table.schema, table.name)}
     pk = introspection.pk_of(table.schema, table.name)
+    seedable_qualified = seedable_qualified if seedable_qualified is not None else set()
+    external_refs = external_refs if external_refs is not None else {}
 
     # If this is the tenant root table, the column children reference must be
     # stamped with the tenant id so child FKs resolve.
@@ -406,6 +422,27 @@ def _insert_row(
             insert_columns.append(column.name)
             insert_values.append(tenant.tenant_id)
             continue
+
+        # FK to a table outside the seedable set (e.g. accounts.owner_user_id →
+        # auth.users): seed a minimal row in that table on demand and point at it.
+        fk = fks_by_col.get(column.name)
+        if (
+            fk is not None
+            and column.name not in (tenant_column, user_id_column)
+            and f"{fk.ref_schema}.{fk.ref_table}" not in seedable_qualified
+            and not tenant.rows(fk.ref_schema, fk.ref_table)
+        ):
+            ext = _ensure_external_ref(
+                conn, introspection, fk.ref_schema, fk.ref_table, fk.ref_column, external_refs
+            )
+            if ext is not None:
+                insert_columns.append(column.name)
+                insert_values.append(ext)
+                continue
+            if not column.nullable:
+                return None, f"unresolved external FK on column {column.name} → {fk.ref_schema}.{fk.ref_table}"
+            continue
+
         value = _resolve_value(
             column,
             fks_by_col=fks_by_col,
@@ -452,6 +489,93 @@ def _insert_row(
         ),
         None,
     )
+
+
+def _ensure_external_ref(
+    conn: psycopg.Connection,
+    introspection: IntrospectionResult,
+    ref_schema: str,
+    ref_table: str,
+    ref_column: str,
+    cache: dict[tuple[str, str], object],
+) -> object | None:
+    """Seed one minimal row in a referenced table outside the seedable set.
+
+    Handles the common Supabase pattern where tenant tables foreign-key to
+    `auth.users` (an excluded, Supabase-managed schema). The referenced table's
+    columns are introspected live (they are not in the cached introspection,
+    which skipped excluded schemas), a minimal row is inserted, and the value
+    of `ref_column` is returned and cached so sibling FKs reuse the same row.
+    """
+    key = (ref_schema, ref_table)
+    if key in cache:
+        return cache[key][1]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, udt_name, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (ref_schema, ref_table),
+        )
+        cols = cur.fetchall()
+    if not cols:
+        return None
+
+    insert_cols: list[str] = []
+    insert_vals: list[object] = []
+    ref_value: object | None = None
+    for name, udt, nullable, default in cols:
+        is_ref = name == ref_column
+        if not is_ref and (default is not None or nullable == "YES"):
+            continue
+        value = _synth_unique(udt)
+        if is_ref:
+            ref_value = value
+        insert_cols.append(name)
+        insert_vals.append(value)
+
+    if ref_value is None:
+        ref_udt = next((u for n, u, _, _ in cols if n == ref_column), "uuid")
+        ref_value = _synth_unique(ref_udt)
+        insert_cols.append(ref_column)
+        insert_vals.append(ref_value)
+
+    cols_sql = ", ".join(f'"{c}"' for c in insert_cols)
+    placeholders = ", ".join(["%s"] * len(insert_vals))
+    sql = (
+        f'INSERT INTO "{ref_schema}"."{ref_table}" ({cols_sql}) '
+        f"VALUES ({placeholders}) ON CONFLICT DO NOTHING "
+        f'RETURNING "{ref_column}"'
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, insert_vals)
+            row = cur.fetchone()
+    except psycopg.Error:
+        return None
+    value = row[0] if row else ref_value
+    cache[key] = (ref_column, value)
+    return value
+
+
+def _synth_unique(udt: str) -> object:
+    """Like synth_value but text is uniquified to dodge UNIQUE constraints."""
+    udt = (udt or "").lower()
+    if "uuid" in udt:
+        return str(uuid.uuid4())
+    if udt in ("int2", "int4", "int8", "numeric", "float4", "float8"):
+        return 0
+    if udt == "bool":
+        return False
+    if "json" in udt:
+        return "{}"
+    if "time" in udt or "date" in udt:
+        return None
+    return f"rlsgrid-{uuid.uuid4().hex[:12]}"
 
 
 class _Sentinel:
