@@ -1,337 +1,122 @@
 # rlsgrid
 
-> Schema-driven Row-Level Security test matrix generator and cross-tenant
-> fuzzer for Postgres and Supabase. Point it at your database, get back a
-> `role × table × operation` matrix, a pgTAP suite, and a fuzz harness that
-> actively tries to leak one tenant's rows into another tenant's session.
+**Catch cross-tenant Row-Level Security leaks in Postgres and Supabase
+before your users do.**
 
+[![CI](https://github.com/matte97p/rlsgrid/actions/workflows/ci.yml/badge.svg)](https://github.com/matte97p/rlsgrid/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/rlsgrid.svg)](https://pypi.org/project/rlsgrid/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
-
-> Built by [Matteo Perino](https://github.com/matte97p) while shipping
-> [GeoSuite](https://trygeosuite.it), a multi-tenant Supabase app with
-> agency/account/store isolation layered on top of Postgres RLS. The library
-> is extracted from the patterns that survived production audits.
 
 <p align="center"><img src="assets/demo.svg" alt="rlsgrid plan and fuzz output" width="760"></p>
 
 ---
 
-## The problem
+## What it does
 
-Postgres RLS is one of the most powerful access-control primitives in the
-ecosystem, and one of the easiest to get subtly wrong. A missing `WITH CHECK`,
-a `FOR ALL` policy where you wanted `FOR SELECT`, a forgotten
-`ENABLE ROW LEVEL SECURITY`, or a `service_role` bypass that quietly leaks
-into a client surface — every one of these is a tenant-isolation incident
-waiting to happen, and unit tests against your application code will not
-catch them.
+Point it at your database. rlsgrid reads the live schema and:
 
-The existing tools split into three camps:
+1. **Maps** every `role × table × operation` and labels it
+   `allow` / `deny` / `conditional` / `unrestricted`.
+2. **Fuzzes** for real cross-tenant leaks — it seeds synthetic tenants and
+   actively tries to read, insert, update, and delete one tenant's rows from
+   another tenant's session.
+3. **Emits** a pgTAP suite you can run in CI.
 
-| Tool | What it does | What it doesn't do |
-|------|--------------|--------------------|
-| `usebasejump/supabase-test-helpers` | pgTAP helpers you write by hand. | Generates nothing. |
-| `pgrls` | Static linter (43 rules). | Doesn't execute policies. |
-| `supashield` | Pentest-style scanner from outside. | Doesn't read your schema. |
-| AI-based generators | LLM writes pgTAP for you. | Hallucinates, opaque, drifts. |
+## Why
 
-`rlsgrid` fills the missing slot: **read your real schema, classify what
-every role can do, emit deterministic tests, then chaos-fuzz for cross-tenant
-leaks at runtime.**
+Postgres RLS is powerful and easy to get subtly wrong: a missing
+`WITH CHECK`, a `FOR ALL` where you meant `FOR SELECT`, a forgotten
+`ENABLE ROW LEVEL SECURITY`, a `service_role` bypass leaking client-side.
+Your application unit tests will not catch any of these — they test your code,
+not the policies. rlsgrid tests the policies, against a real database.
 
-## Install
+## Use it
 
 ```bash
 pip install rlsgrid
+
+export DATABASE_URL=postgresql://user:pw@host/db   # use staging, never prod
+
+rlsgrid init --from-db      # read the schema, write an annotated config
+rlsgrid check --tenants 5   # seed → fuzz → teardown. exit 1 on any leak.
 ```
 
-## Quickstart
-
-```bash
-# 1. Point DATABASE_URL at a non-production database.
-export DATABASE_URL=postgresql://user:pw@host/db
-
-# 2. Generate a config by reading the live schema — rlsgrid guesses the
-#    tenant column, detects the tenant root table, and recognises Supabase.
-rlsgrid init --from-db
-
-# 3. One-shot safety check: seed synthetic tenants, fuzz cross-tenant
-#    access, tear everything down. Exit 1 on any breach.
-rlsgrid check --tenants 5
-```
-
-That's the whole loop. `check` leaves nothing behind and is the command to
-drop into CI. The lower-level commands are there when you want them:
-
-```bash
-rlsgrid introspect                 # tables, RLS state, policies
-rlsgrid plan                       # the role × table × op matrix
-rlsgrid gen pgtap --out tests/rls/generated.sql   # emit a pgTAP suite
-pg_prove -d "$DATABASE_URL" tests/rls/generated.sql
-rlsgrid fuzz --tenants 5           # fuzz only (auto-cleans up)
-```
-
-## What you get
-
-### The matrix
+`check` is the whole loop: it leaves nothing behind and returns non-zero on a
+breach, so it drops straight into CI. A leak looks like:
 
 ```
-┌────────────────┬─────────────────┬────────┬──────────────┬───────────────────┐
-│ Role           │ Table           │ Op     │ Expected     │ Policies          │
-├────────────────┼─────────────────┼────────┼──────────────┼───────────────────┤
-│ authenticated  │ public.posts    │ SELECT │ conditional  │ posts_owner_all   │
-│ authenticated  │ public.posts    │ INSERT │ conditional  │ posts_owner_all   │
-│ anon           │ public.posts    │ SELECT │ deny         │ —                 │
-│ service_role   │ public.posts    │ SELECT │ unrestricted │ — (BYPASSRLS)     │
-└────────────────┴─────────────────┴────────┴──────────────┴───────────────────┘
-```
-
-Every cell is classified by reading `pg_policies` + `pg_class`:
-
-- **allow** — at least one permissive policy applies and gates nothing.
-- **deny** — RLS is enabled and no permissive policy matches the role/op.
-- **conditional** — a policy applies but a `USING` / `WITH CHECK` expression
-  gates which rows. Runtime check needed (this is where chaos-fuzz comes in).
-- **unrestricted** — RLS is off or the role has `BYPASSRLS`. Surfaced
-  explicitly so you notice when you didn't mean it.
-
-### The pgTAP suite
-
-For every ALLOW / DENY cell, rlsgrid emits a probe that exercises the policy
-without touching real rows:
-
-```sql
-SET LOCAL ROLE "anon";
-SELECT throws_ok(
-  $rlsgrid$ SELECT * FROM "public"."posts" LIMIT 0 $rlsgrid$,
-  '42501', NULL,
-  'anon cannot SELECT public.posts'
-);
-RESET ROLE;
-```
-
-CONDITIONAL cells aren't asserted at the pgTAP layer — that's chaos-fuzz's
-job, because the truth requires real per-tenant rows.
-
-### The chaos fuzzer
-
-`rlsgrid fuzz` seeds N synthetic tenants — walking the FK graph in
-topological order so child rows reference their tenant's parent rows — then
-repeatedly picks `(actor, target, cell)` triples drawn from the
-`CONDITIONAL` and `ALLOW` cells of the matrix and runs four probes against
-the target's data while the actor's session is active:
-
-| Probe   | What it asks                                                       |
-|---------|--------------------------------------------------------------------|
-| SELECT  | Can the actor see any of target's rows?                            |
-| INSERT  | Can the actor write a row stamped with the target's tenant id?     |
-| UPDATE  | Can the actor mutate a row owned by the target (by PK)?            |
-| DELETE  | Can the actor delete a row owned by the target (by PK)?            |
-
-Every probe runs in its own transaction that rolls back on completion, so
-the database state never moves between iterations.
-
-```
-✗ 1 breach(es) detected
+✗ 1 cross-tenant breach detected
   LEAK role=authenticated actor_tenant=a1b2 → target_tenant=c3d4
-       on public.posts SELECT: 3 rows visible across tenants
+       on public.documents UPDATE: target-owned row visible across tenants
 ```
 
-### Function mode
-
-When access is not enforced by RLS but by a backend helper — the GeoSuite
-pattern, where `check_user_has_access_to_store(user_id, store_id)` is the
-final gate — set `tenancy.mode = "function"` and point `access_function` at
-the helper with `{user_id}` and `{row_id}` placeholders:
-
-```toml
-[tenancy]
-mode = "function"
-access_function = "check_user_has_access_to_store({user_id}, {row_id})"
-```
-
-The fuzz harness then iterates every `(actor, target_row)` pair across the
-seeded tenants and calls the helper with cross-tenant arguments. If it ever
-returns `true`, that is a breach with the same Breach shape as the RLS-mode
-probes.
-
-### JWT shape
-
-Modern Supabase (v2+) stores every claim in a single GUC,
-`request.jwt.claims`, as JSON — that's what `auth.jwt()` reads. Older
-deployments set one GUC per claim (`request.jwt.claim.sub`, etc.). rlsgrid
-defaults to the modern shape; override per project:
-
-```toml
-[tenancy]
-jwt_shape = "json"  # or "individual"
-jwt_claims = { sub = "{user_id}", tenant_id = "{tenant_id}", role = "authenticated" }
-```
-
-Both `{user_id}` and `{tenant_id}` are filled per actor before each probe.
-
-### Prod-guard
-
-The write-capable commands (`seed`, `fuzz`) refuse to run when the URL
-matches any pattern in `[safety].forbid_url_patterns`. The default list is
-`["prod", "production"]`. To override on purpose, set
-`RLSGRID_I_KNOW_WHAT_IM_DOING=1` — the awkward name is intentional.
-
-### JSON output for CI
-
-Every read command (`introspect`, `plan`) and every write command (`seed`,
-`fuzz`) accepts `--json`. The shape is stable enough to drive PR-comment
-bots, dashboards, or threshold gates without parsing terminal output.
-
-```bash
-rlsgrid fuzz --json | jq '.breaches | length'
-```
-
-## Configuration
-
-Per-stack starting configs (Supabase, Prisma, Drizzle, SQLAlchemy, Rails,
-and function mode) live in [docs/RECIPES.md](docs/RECIPES.md).
-
-`rlsgrid.toml` lives at your repo root. The interesting part is the
-`[tenancy]` block, which tells rlsgrid how isolation is supposed to work:
-
-```toml
-[tenancy]
-# Supabase-classic: policies read auth.uid() from the JWT.
-mode = "jwt"
-tenant_column = "tenant_id"
-auth_function = "auth.uid()"
-
-# Or: access delegated to a SQL helper (e.g. GeoSuite-style).
-# mode = "function"
-# access_function = "check_user_has_access_to_store(p_user_id, p_store_id)"
-```
-
-The two modes exist because real production schemas don't all look like the
-Supabase quickstart. The function-based mode covers the pattern where the
-application layer asks Postgres "does this user have access to this row?"
-via a stable function — rlsgrid will still build the matrix and the fuzz
-will still find cross-tenant leaks.
-
-### Verified-RLS badge
-
-`fuzz` can also write a status badge so projects can advertise that they
-test cross-tenant isolation in CI. Two formats:
-
-```bash
-# shields.io endpoint JSON — no asset hosting, commit the JSON file
-rlsgrid fuzz --shields-out badge.json
-
-# Static SVG — host wherever you like
-rlsgrid fuzz --badge-out badge.svg
-```
-
-Embed in your project README:
-
-```markdown
-[![rlsgrid](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/USER/REPO/main/badge.json)](https://github.com/USER/REPO)
-```
-
-The badge turns green when the fuzz run reports no breaches and red as
-soon as one shows up.
-
-## When to reach for rlsgrid vs the alternatives
-
-`usebasejump/supabase-test-helpers` is the de-facto Supabase RLS testing
-toolkit. It ships a set of pgTAP helpers (`tests.authenticate_as`,
-`tests.rls_enabled`, …) so you can hand-write assertions like:
-
-```sql
-SELECT tests.authenticate_as('alice');
-SELECT results_eq(
-  'SELECT count(*) FROM posts',
-  ARRAY[1::bigint],
-  'alice sees only her own posts'
-);
-```
-
-That style is excellent when you have a small fixed surface and want to
-encode bespoke business rules. It struggles when the surface grows: every
-new role, table or operation is another pgTAP file you write and maintain
-by hand, and you do not get told about regressions until someone remembers
-to add the test.
-
-`rlsgrid` solves the other half of the problem:
-
-| | `supabase-test-helpers` | `rlsgrid` |
-|---|---|---|
-| Style | Hand-written pgTAP | Schema-driven generation + runtime fuzz |
-| New table lands without a test | Silent | Surfaces immediately in `plan` / `gen pgtap` |
-| Cross-tenant write leaks | Whatever you remember to test | Probed automatically (`fuzz` SELECT/INSERT/UPDATE/DELETE) |
-| Function-based access checks | Not modelled | First-class (`tenancy.mode = "function"`) |
-| CI integration | You wire it | One-step GitHub Action with JSON output |
-| Setup cost | Low | Low (single `rlsgrid.toml`) |
-| Best for | Encoding "this specific user must see exactly these rows" | Catching the broad class of "we forgot to lock this down" |
-
-They compose well: keep your high-signal `supabase-test-helpers` cases for
-the business rules you care about most, and let `rlsgrid` watch the floor.
-
-## GitHub Action
-
-The repo ships a composite GitHub Action so dropping rlsgrid into a CI
-workflow is one step:
+### In CI (GitHub Action)
 
 ```yaml
 - uses: matte97p/rlsgrid@v1
   with:
-    command: fuzz
-    config: rlsgrid.toml
+    command: check
     database-url: ${{ secrets.STAGING_DB_URL }}
-    fail-on-breach: true
 ```
 
-Inputs: `command` (introspect/plan/gen-pgtap/seed/fuzz), `config`,
-`database-url` (required), `tenants`, `python-version`, `version` (pin a
-rlsgrid release), `pgtap-out`, `fail-on-breach`.
+### Lower-level commands
 
-Outputs: `result-json` (path to JSON report), `breach-count`.
-
-Full example workflow that gates a PR on cross-tenant leaks against a
-disposable Postgres service:
-
-```yaml
-name: rls-fuzz
-on:
-  pull_request:
-    paths: ["supabase/migrations/**", "rlsgrid.toml"]
-jobs:
-  fuzz:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=5s --health-timeout=5s --health-retries=10
-    steps:
-      - uses: actions/checkout@v4
-      - run: psql "$PG" -f supabase/migrations/*.sql
-        env:
-          PG: postgresql://postgres:postgres@localhost:5432/postgres
-      - uses: matte97p/rlsgrid@v1
-        with:
-          command: fuzz
-          database-url: postgresql://postgres:postgres@localhost:5432/postgres
-          tenants: "5"
+```bash
+rlsgrid introspect          # tables, RLS state, policies
+rlsgrid plan                # the full matrix
+rlsgrid gen pgtap --out tests/rls/generated.sql   # emit a pgTAP suite
+rlsgrid fuzz --tenants 5    # fuzz only (auto-cleans up)
+rlsgrid seed --dry-run      # show the seed plan without writing
 ```
 
-Pin to a specific release in production (`matte97p/rlsgrid@v0.1.0`).
+Config for your stack — Supabase, Prisma, Drizzle, SQLAlchemy, Rails,
+function-based access checks — is in [docs/RECIPES.md](docs/RECIPES.md).
+
+## How it classifies a cell
+
+- **allow** — a permissive policy applies and gates nothing.
+- **deny** — RLS is on and no policy matches the role/op.
+- **conditional** — a policy applies but a `USING` / `WITH CHECK` expression
+  gates which rows. This is where the fuzz earns its keep.
+- **unrestricted** — RLS is off, or the role has `BYPASSRLS`. Surfaced
+  explicitly so you notice when you did not mean it.
+
+## Two enforcement models
+
+- **RLS at the database** (the Supabase default): the fuzz finds leaks
+  directly. Set `tenancy.mode = "jwt"`.
+- **Access enforced by a SQL function** (e.g.
+  `check_user_has_access_to_store(user_id, store_id)`): set
+  `tenancy.mode = "function"` and rlsgrid calls the helper with cross-tenant
+  arguments, asserting it returns false.
+
+## How it compares
+
+| | hand-written pgTAP | static linters | **rlsgrid** |
+|---|---|---|---|
+| New table lands without a test | silent | maybe | shows up in `plan` |
+| Cross-tenant write leaks | only if you wrote that test | no | probed automatically |
+| Function-based access | no | no | first-class |
+| Setup | per-test | low | one config |
+
+It composes with [`supabase-test-helpers`](https://github.com/usebasejump/supabase-test-helpers):
+keep your bespoke business-rule pgTAP, let rlsgrid watch the floor.
+
+## Safety
+
+`seed`, `fuzz`, and `check` write to the database, so they refuse any URL
+matching `[safety].forbid_url_patterns` (default `["prod", "production"]`).
+Point `DATABASE_URL` at staging or a disposable database.
 
 ## Status
 
-Alpha. Stable enough to run on real schemas; the pgTAP output and config
-shape may shift before 1.0. Issues and PRs welcome — see
-[CONTRIBUTING](CONTRIBUTING.md).
+Alpha, but exercised end to end in CI against a rich multi-tenant schema and
+run through `pg_prove`. The config shape may still shift before 1.0. Issues
+and PRs welcome — see [CONTRIBUTING](CONTRIBUTING.md).
+
+Built by [Matteo Perino](https://github.com/matte97p) while shipping
+[GeoSuite](https://trygeosuite.it), a multi-tenant Supabase app.
 
 ## License
 

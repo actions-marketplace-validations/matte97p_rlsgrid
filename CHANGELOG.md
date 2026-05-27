@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-27
+
+### Added
+- Self-referential foreign keys are seedable: a hierarchical table with a
+  NOT NULL `parent_id` → its own `id` no longer blocks seeding. When the PK
+  is a single uuid, the first row is pointed at itself.
+- `rlsgrid seed --dry-run` prints the seed plan (tenant column, detected root
+  table, table order) without writing anything.
+- Loud warning when seeding produces zero rows — a wrong `tenant_column`
+  otherwise yields a misleading "no breach". `init --from-db` also warns when
+  the guessed tenant column is not a foreign key or several tenant-like
+  foreign keys exist (composite keys are documented as unsupported).
+- Docs site (mkdocs-material) published from `docs/`.
+
+### Notes
+- Verified on a 120-table schema: introspection ~30 ms, matrix build ~2 ms.
+- README rewritten for fast comprehension (what / why / use).
+
 ## [0.2.0] — 2026-05-27
 
 Fewer steps, no manual config, nothing left behind.

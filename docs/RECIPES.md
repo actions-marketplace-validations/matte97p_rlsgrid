@@ -97,6 +97,22 @@ tenant_column = "account_id"
 access_function = "user_can_access_record({user_id}, {row_id})"
 ```
 
+## Composite tenant keys (not supported)
+
+rlsgrid identifies a tenant by a single column. If your isolation key is a
+pair (e.g. `(region, tenant_id)`), there is no first-class support yet.
+Workarounds:
+
+- Point `tenant_column` at the most-specific single column (usually the one
+  that alone determines the tenant); the broader column is then redundant for
+  isolation testing.
+- If isolation genuinely needs both columns, test it with `mode = "function"`
+  against the access helper that takes both:
+  `access_function = "has_access({user_id}, {row.region}, {row.tenant_id})"`.
+
+`init --from-db` warns when it sees several tenant-like foreign keys so you
+can pick the right one.
+
 ## Function mode (any stack with an access helper)
 
 When a SQL function is the real gate (e.g. GeoSuite's

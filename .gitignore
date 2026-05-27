@@ -21,3 +21,5 @@ htmlcov/
 *.swp
 .DS_Store
 node_modules/
+site/
+docs/CHANGELOG.md

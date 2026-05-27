@@ -68,6 +68,21 @@ def detect(introspection: IntrospectionResult) -> Detection:
         f"tenant_column guessed as '{tenant_column}'"
         + (" (found as a foreign key)" if tenant_root else " (no FK found — verify this)")
     )
+    fk_cols = {fk.column for fk in introspection.foreign_keys}
+    hint_fks = [h for h in TENANT_HINTS if h in fk_cols]
+    if len(hint_fks) > 1:
+        notes.append(
+            "multiple tenant-like FK columns found "
+            f"({', '.join(hint_fks)}); picked '{tenant_column}'. "
+            "Composite tenant keys are not supported — set tenant_column to the "
+            "single most-specific column if this guess is wrong."
+        )
+    if tenant_root is None:
+        notes.append(
+            "WARNING: tenant_column is not a foreign key. If it does not actually "
+            "scope tenants, seeding yields no rows and the fuzz reports a misleading "
+            "'no breach'. Double-check tenant_column."
+        )
     if tenant_root:
         notes.append(
             f"tenant root table detected: {tenant_root[0]}.{tenant_root[1]} "

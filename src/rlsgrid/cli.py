@@ -18,7 +18,7 @@ from .autodetect import detect, render_config
 from .badge import from_fuzz_report, make_shields_json, make_svg
 from .config import DEFAULT_CONFIG_TEMPLATE, Config
 from .emitters import pgtap as pgtap_emitter
-from .fixtures import seed_tenants, teardown_from_state, teardown_state
+from .fixtures import build_seed_plan, seed_tenants, teardown_from_state, teardown_state
 from .fuzz import chaos
 from .introspect import introspect as run_introspect
 from .matrix import Expected, build_matrix, summarize
@@ -310,11 +310,46 @@ def gen_pgtap(config_path: str, out_path: str, state_path: str | None) -> None:
     default=None,
     help="Persist the seeded tenant state to a JSON file (for later teardown or pgTAP gen).",
 )
-def seed(config_path: str, tenants: int, as_json: bool, state_out: str | None) -> None:
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    help="Show the seed plan (tables, order, detected root) without writing anything.",
+)
+def seed(config_path: str, tenants: int, as_json: bool, state_out: str | None, dry_run: bool) -> None:
     """Seed N synthetic tenants into every RLS table carrying tenant_column."""
     cfg = _load(config_path)
-    _guard_writes(cfg)
     result = _introspect(cfg)
+
+    if dry_run:
+        plan = build_seed_plan(result, cfg)
+        if as_json:
+            _dump_json(
+                {
+                    "tenant_column": plan.tenant_column,
+                    "tenant_root": list(plan.tenant_root) if plan.tenant_root else None,
+                    "order": [t.qualified for t in plan.ordered_tables],
+                }
+            )
+            return
+        console.print(f"[bold]Seed plan[/bold] (tenant_column = '{plan.tenant_column}')")
+        if plan.tenant_root:
+            s, t, c = plan.tenant_root
+            console.print(f"  root table: [green]{s}.{t}[/green] keyed on '{c}' (seeded first)")
+        else:
+            console.print(
+                "  [yellow]no tenant root table found — tenant_column is not a foreign key; "
+                "verify it is correct[/yellow]"
+            )
+        if not plan.ordered_tables:
+            console.print(
+                "  [red]nothing to seed: no RLS table carries this tenant_column.[/red]"
+            )
+        for i, table in enumerate(plan.ordered_tables, 1):
+            console.print(f"  {i}. {table.qualified}")
+        return
+
+    _guard_writes(cfg)
     seed_report = _run_writes(seed_tenants, result, cfg, tenants=tenants)
     if state_out:
         seed_report.write_state(state_out)
@@ -404,6 +439,8 @@ def fuzz(
     seed_report = _run_writes(seed_tenants, result, cfg, tenants=tenants)
     if state_out:
         seed_report.write_state(state_out)
+    if not as_json:
+        _warn_if_no_rows(seed_report, cfg)
     if len(seed_report.tenants) < 2:
         msg = "Seeder produced fewer than 2 tenants — cannot fuzz."
         if as_json:
@@ -480,6 +517,31 @@ def _print_skip_reasons(report: chaos.FuzzReport) -> None:
         console.print(f"  [dim]- {reason}: {count}[/dim]")
 
 
+def _warn_if_no_rows(seed_report, cfg: Config) -> bool:
+    """Loudly warn when seeding produced nothing — a wrong tenant_column makes
+    every probe vacuous and the run reports a misleading 'no breach'.
+
+    Returns True if the warning fired.
+    """
+    total = sum(len(rs) for t in seed_report.tenants for rs in t.rows_by_table.values())
+    if total > 0:
+        return False
+    console.print(
+        "[bold red]⚠ No rows were seeded.[/bold red] "
+        f"tenant_column='[bold]{cfg.tenancy.tenant_column}[/bold]' likely does not match your "
+        "schema, so every cross-tenant probe is vacuous and results are NOT trustworthy."
+    )
+    if seed_report.skipped:
+        console.print("Seeder skip reasons:")
+        for qualified, reason in seed_report.skipped:
+            console.print(f"  - {qualified}: {reason}")
+    console.print(
+        "Fix [bold]tenancy.tenant_column[/bold] in your config "
+        "(or re-run [bold]rlsgrid init --from-db[/bold]) and try again."
+    )
+    return True
+
+
 @main.command()
 @click.option("--config", "config_path", default="rlsgrid.toml", show_default=True)
 @click.option("--state", "state_path", required=True, help="Seed-state JSON written by `rlsgrid seed --state-out`.")
@@ -527,6 +589,8 @@ def check(config_path: str, tenants: int, as_json: bool) -> None:
     result = _introspect(cfg)
     seed_report = _run_writes(seed_tenants, result, cfg, tenants=tenants)
     try:
+        if not as_json:
+            _warn_if_no_rows(seed_report, cfg)
         if len(seed_report.tenants) < 2:
             msg = "Seeder produced fewer than 2 tenants — cannot run cross-tenant checks."
             if as_json:

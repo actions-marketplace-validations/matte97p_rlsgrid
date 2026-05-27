@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
-from rlsgrid.fixtures import _detect_tenant_root, topological_sort
-from rlsgrid.introspect import ForeignKeyInfo, IntrospectionResult, TableInfo
+from rlsgrid.config import Config, ConnectionConfig, TenancyConfig
+from rlsgrid.fixtures import (
+    _detect_tenant_root,
+    _pregenerate_self_reference,
+    build_seed_plan,
+    topological_sort,
+)
+from rlsgrid.introspect import (
+    ColumnInfo,
+    ForeignKeyInfo,
+    IntrospectionResult,
+    TableInfo,
+)
 
 
 def _table(name: str) -> TableInfo:
@@ -114,3 +125,60 @@ def test_topological_sort_ignores_self_reference() -> None:
     )
     ordered = topological_sort(tables, intro)
     assert [t.name for t in ordered] == ["nodes"]
+
+
+def test_pregenerate_self_reference_uuid_pk() -> None:
+    table = TableInfo(schema="public", name="nodes", rls_enabled=True, rls_forced=False)
+    columns = [
+        ColumnInfo("public", "nodes", "id", "uuid", False, True),
+        ColumnInfo("public", "nodes", "parent_id", "uuid", False, False),
+    ]
+    fks = {
+        "parent_id": ForeignKeyInfo(
+            schema="public",
+            table="nodes",
+            column="parent_id",
+            ref_schema="public",
+            ref_table="nodes",
+            ref_column="id",
+        )
+    }
+    pre = _pregenerate_self_reference(table, columns, fks, ("id",))
+    # id and the self-FK get the same pre-generated value (row points at itself)
+    assert pre["id"] == pre["parent_id"]
+    assert pre["id"]
+
+
+def test_pregenerate_skips_non_uuid_pk() -> None:
+    table = TableInfo(schema="public", name="nodes", rls_enabled=True, rls_forced=False)
+    columns = [ColumnInfo("public", "nodes", "id", "int4", False, True)]
+    fks = {
+        "parent_id": ForeignKeyInfo(
+            schema="public",
+            table="nodes",
+            column="parent_id",
+            ref_schema="public",
+            ref_table="nodes",
+            ref_column="id",
+        )
+    }
+    assert _pregenerate_self_reference(table, columns, fks, ("id",)) == {}
+
+
+def test_build_seed_plan_orders_root_first_across_schemas() -> None:
+    tables = [
+        TableInfo(schema="app", name="projects", rls_enabled=True, rls_forced=False),
+        TableInfo(schema="core", name="orgs", rls_enabled=True, rls_forced=False),
+    ]
+    intro = IntrospectionResult(
+        tables=tables,
+        foreign_keys=[
+            ForeignKeyInfo("app", "projects", "org_id", "core", "orgs", "id"),
+        ],
+        columns=[ColumnInfo("app", "projects", "org_id", "uuid", False, False)],
+    )
+    cfg = Config(connection=ConnectionConfig(url="postgresql://noop"), tenancy=TenancyConfig(tenant_column="org_id"))
+    plan = build_seed_plan(intro, cfg)
+    names = [t.qualified for t in plan.ordered_tables]
+    assert plan.tenant_root == ("core", "orgs", "id")
+    assert names.index("core.orgs") < names.index("app.projects")

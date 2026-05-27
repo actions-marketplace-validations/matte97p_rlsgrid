@@ -193,17 +193,22 @@ def _delete_rows_by_pk(
         return False, 0, f"{type(exc).__name__}: {exc}".splitlines()[0][:200]
 
 
-def seed_tenants(
+@dataclass
+class SeedPlan:
+    ordered_tables: list[TableInfo]
+    tenant_root: tuple[str, str, str] | None
+    tenant_column: str
+
+
+def build_seed_plan(
     introspection: IntrospectionResult,
     config: Config,
-    tenants: int = 3,
-) -> SeedReport:
-    if tenants < 2:
-        raise ValueError("seed at least 2 tenants for cross-tenant fuzz")
+) -> SeedPlan:
+    """Compute which tables get seeded and in what order — no DB writes.
 
+    Powers `seed --dry-run` and is reused by `seed_tenants`.
+    """
     tenant_column = config.tenancy.tenant_column
-    user_id_column = config.tenancy.user_id_column
-
     # The tenant root table keys the tenant on its own PK and is referenced by
     # children through `tenant_column` (e.g. orgs.id ← projects.org_id). It does
     # not carry tenant_column itself, so it must be detected via the FK graph
@@ -228,6 +233,22 @@ def seed_tenants(
         if root_info is not None:
             seedable_set.setdefault(root_info.qualified, root_info)
     ordered = topological_sort(list(seedable_set.values()), introspection)
+    return SeedPlan(ordered_tables=ordered, tenant_root=tenant_root, tenant_column=tenant_column)
+
+
+def seed_tenants(
+    introspection: IntrospectionResult,
+    config: Config,
+    tenants: int = 3,
+) -> SeedReport:
+    if tenants < 2:
+        raise ValueError("seed at least 2 tenants for cross-tenant fuzz")
+
+    user_id_column = config.tenancy.user_id_column
+    plan = build_seed_plan(introspection, config)
+    tenant_column = plan.tenant_column
+    tenant_root = plan.tenant_root
+    ordered = plan.ordered_tables
 
     report = SeedReport(tenant_column=tenant_column)
     report.check_warnings = [
@@ -317,6 +338,36 @@ def topological_sort(
     return [by_qualified[q] for q in out]
 
 
+def _pregenerate_self_reference(
+    table: TableInfo,
+    columns: list[ColumnInfo],
+    fks_by_col: dict[str, ForeignKeyInfo],
+    pk: tuple[str, ...],
+) -> dict[str, object]:
+    """Pre-generate a PK value shared by self-referential FK columns.
+
+    Only handles the common case: a single-column uuid primary key with one
+    or more NOT NULL foreign keys that reference the same table. The row is
+    made to point at itself. Returns {} when the pattern does not apply.
+    """
+    self_fks = [
+        fk.column
+        for fk in fks_by_col.values()
+        if (fk.ref_schema, fk.ref_table) == (table.schema, table.name)
+    ]
+    if not self_fks or len(pk) != 1:
+        return {}
+    pk_col = pk[0]
+    pk_type = next((c.type_name for c in columns if c.name == pk_col), "")
+    if "uuid" not in (pk_type or "").lower():
+        return {}
+    value = str(uuid.uuid4())
+    out: dict[str, object] = {pk_col: value}
+    for col in self_fks:
+        out[col] = value
+    return out
+
+
 def _insert_row(
     conn: psycopg.Connection,
     *,
@@ -338,10 +389,19 @@ def _insert_row(
     if tenant_root is not None and (table.schema, table.name) == (tenant_root[0], tenant_root[1]):
         root_col = tenant_root[2]
 
+    # Self-referential FK (e.g. nodes.parent_id → nodes.id): if the PK is a
+    # single uuid we can pre-generate, point the first row at itself so a
+    # NOT NULL self-FK does not block seeding hierarchical tables.
+    pregenerated = _pregenerate_self_reference(table, columns, fks_by_col, pk)
+
     insert_columns: list[str] = []
     insert_values: list[object] = []
 
     for column in columns:
+        if column.name in pregenerated:
+            insert_columns.append(column.name)
+            insert_values.append(pregenerated[column.name])
+            continue
         if root_col is not None and column.name == root_col:
             insert_columns.append(column.name)
             insert_values.append(tenant.tenant_id)
