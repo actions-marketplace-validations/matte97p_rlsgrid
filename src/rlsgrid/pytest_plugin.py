@@ -15,13 +15,12 @@ with `-p no:rlsgrid`.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-from .config import Config
-from .fixtures import seed_tenants, teardown_state
-from .fuzz import chaos
-from .fuzz.chaos import FuzzReport
-from .introspect import introspect
+if TYPE_CHECKING:
+    from .fuzz.chaos import FuzzReport
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -50,6 +49,14 @@ class RlsgridRunner:
 
     def check(self, *, tenants: int | None = None) -> FuzzReport:
         """Seed → fuzz → teardown. Returns the FuzzReport (assert `.ok`)."""
+        # Imported lazily so merely loading this plugin (which pytest does at
+        # startup, before coverage instrumentation) doesn't import the whole
+        # package and make it show up as "imported but not measured".
+        from .config import Config
+        from .fixtures import seed_tenants, teardown_state
+        from .fuzz import chaos
+        from .introspect import introspect
+
         cfg = Config.load(self.config_path)
         introspection = introspect(cfg)
         seed_report = seed_tenants(introspection, cfg, tenants=tenants or self.tenants)
