@@ -14,6 +14,8 @@
 > agency/account/store isolation layered on top of Postgres RLS. The library
 > is extracted from the patterns that survived production audits.
 
+<p align="center"><img src="assets/demo.svg" alt="rlsgrid plan and fuzz output" width="760"></p>
+
 ---
 
 ## The problem
@@ -185,6 +187,9 @@ rlsgrid fuzz --json | jq '.breaches | length'
 ```
 
 ## Configuration
+
+Per-stack starting configs (Supabase, Prisma, Drizzle, SQLAlchemy, Rails,
+and function mode) live in [docs/RECIPES.md](docs/RECIPES.md).
 
 `rlsgrid.toml` lives at your repo root. The interesting part is the
 `[tenancy]` block, which tells rlsgrid how isolation is supposed to work:

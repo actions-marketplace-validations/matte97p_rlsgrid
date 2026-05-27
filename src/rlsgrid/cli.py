@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import psycopg
 from rich.console import Console
 from rich.table import Table
 
@@ -40,6 +41,28 @@ def _guard_writes(cfg: Config) -> None:
     except ProdGuardViolation as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(3)
+
+
+def _introspect(cfg: Config):
+    """Run introspection, turning connection failures into a clean message."""
+    try:
+        return run_introspect(cfg)
+    except psycopg.OperationalError as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        console.print(f"[red]Cannot connect to the database:[/red] {first}")
+        console.print("Check [bold]connection.url[/bold] (or the env var it points at) in your config.")
+        sys.exit(4)
+
+
+def _run_writes(fn, *args, **kwargs):
+    """Wrap a write-capable operation, mapping connection errors to exit 4."""
+    try:
+        return fn(*args, **kwargs)
+    except psycopg.OperationalError as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        console.print(f"[red]Cannot connect to the database:[/red] {first}")
+        console.print("Check [bold]connection.url[/bold] (or the env var it points at) in your config.")
+        sys.exit(4)
 
 
 def _dump_json(payload: dict[str, Any]) -> None:
@@ -86,7 +109,7 @@ def init(out_path: str, force: bool) -> None:
 def introspect(config_path: str, as_json: bool) -> None:
     """Print a summary of tables, RLS state, and policies."""
     cfg = _load(config_path)
-    result = run_introspect(cfg)
+    result = _introspect(cfg)
 
     if as_json:
         _dump_json(
@@ -141,7 +164,7 @@ def introspect(config_path: str, as_json: bool) -> None:
 def plan(config_path: str, show: str, as_json: bool) -> None:
     """Print the role × table × op matrix and expected outcomes."""
     cfg = _load(config_path)
-    result = run_introspect(cfg)
+    result = _introspect(cfg)
     cells = build_matrix(result, cfg)
     visible = [c for c in cells if show == "all" or c.expected.value == show]
 
@@ -218,7 +241,7 @@ def gen_pgtap(config_path: str, out_path: str, state_path: str | None) -> None:
     using the seeded tenant UUIDs.
     """
     cfg = _load(config_path)
-    result = run_introspect(cfg)
+    result = _introspect(cfg)
     cells = build_matrix(result, cfg)
     seed_state = None
     if state_path:
@@ -254,8 +277,8 @@ def seed(config_path: str, tenants: int, as_json: bool, state_out: str | None) -
     """Seed N synthetic tenants into every RLS table carrying tenant_column."""
     cfg = _load(config_path)
     _guard_writes(cfg)
-    result = run_introspect(cfg)
-    seed_report = seed_tenants(result, cfg, tenants=tenants)
+    result = _introspect(cfg)
+    seed_report = _run_writes(seed_tenants, result, cfg, tenants=tenants)
     if state_out:
         seed_report.write_state(state_out)
 
@@ -332,8 +355,8 @@ def fuzz(
     """Seed N tenants and run cross-tenant chaos. Exit 1 on any breach."""
     cfg = _load(config_path)
     _guard_writes(cfg)
-    result = run_introspect(cfg)
-    seed_report = seed_tenants(result, cfg, tenants=tenants)
+    result = _introspect(cfg)
+    seed_report = _run_writes(seed_tenants, result, cfg, tenants=tenants)
     if state_out:
         seed_report.write_state(state_out)
     if len(seed_report.tenants) < 2:
@@ -344,7 +367,7 @@ def fuzz(
             console.print(f"[red]{msg}[/red]")
         sys.exit(2)
 
-    report = chaos.run(result, cfg, seeded_tenants=seed_report.tenants)
+    report = _run_writes(chaos.run, result, cfg, seeded_tenants=seed_report.tenants)
 
     if shields_out or badge_out:
         badge = from_fuzz_report(
@@ -363,6 +386,7 @@ def fuzz(
                 "ok": report.ok,
                 "iterations": report.iterations,
                 "skipped": report.skipped,
+                "skip_reasons": dict(report.skip_reasons),
                 "breaches": [
                     {
                         "actor_role": b.actor_role,
@@ -384,6 +408,7 @@ def fuzz(
             f"[green]✓ No breaches[/green] in {report.iterations} iterations "
             f"({report.skipped} skipped)."
         )
+        _print_skip_reasons(report)
         return
 
     console.print(f"[red]✗ {len(report.breaches)} breach(es) detected[/red]")
@@ -393,7 +418,16 @@ def fuzz(
             f"→ target_tenant={b.target_tenant} on {b.schema}.{b.table} {b.operation}: "
             f"{b.detail}"
         )
+    _print_skip_reasons(report)
     sys.exit(1)
+
+
+def _print_skip_reasons(report: chaos.FuzzReport) -> None:
+    if not report.skip_reasons:
+        return
+    console.print("[dim]Skipped probe reasons:[/dim]")
+    for reason, count in report.skip_reasons.most_common():
+        console.print(f"  [dim]- {reason}: {count}[/dim]")
 
 
 @main.command()
@@ -404,7 +438,7 @@ def teardown(config_path: str, state_path: str, as_json: bool) -> None:
     """Delete rows seeded earlier (idempotent — safe to run twice)."""
     cfg = _load(config_path)
     _guard_writes(cfg)
-    report = teardown_from_state(state_path, cfg)
+    report = _run_writes(teardown_from_state, state_path, cfg)
 
     if as_json:
         _dump_json(

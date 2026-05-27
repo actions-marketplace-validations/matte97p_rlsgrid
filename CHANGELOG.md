@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-27
+
+### Added
+- Clean connection-error UX: a bad or unreachable `connection.url` now exits
+  with a one-line message and code 4 instead of a psycopg traceback.
+- `rlsgrid fuzz` reports *why* probes were skipped (no target row, no primary
+  key, access-function unresolved, …) in both the table and `--json` output.
+- Real pgTAP execution in CI: the generated suite is run with `pg_prove`
+  against Postgres 16 + pgTAP, so "rlsgrid emits a passing pgTAP suite" is
+  proven, not just asserted non-empty.
+- Coverage floor (`--cov-fail-under=50`) on the unit job.
+- Per-stack config recipes in `docs/RECIPES.md` (Supabase, Prisma, Drizzle,
+  SQLAlchemy/Alembic, Rails, function mode).
+- README demo image rendered from real `plan` + `fuzz` output.
+
+### Verified
+- Cross-schema topological seeding and tenant-root detection are covered by
+  unit tests; the full pipeline runs against a rich multi-tenant schema in CI.
+
 ## [0.1.1] — 2026-05-27
 
 Correctness pass driven by running the full pipeline against a rich

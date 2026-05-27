@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import random
 import re
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -45,11 +46,23 @@ class Breach:
     detail: str
 
 
+@dataclass(frozen=True)
+class _Skip:
+    """A probe that could not run, with a human-readable reason."""
+
+    reason: str
+
+
 @dataclass
 class FuzzReport:
     iterations: int
     breaches: list[Breach] = field(default_factory=list)
     skipped: int = 0
+    skip_reasons: Counter[str] = field(default_factory=Counter)
+
+    def _record_skip(self, skip: _Skip) -> None:
+        self.skipped += 1
+        self.skip_reasons[skip.reason] += 1
 
     @property
     def ok(self) -> bool:
@@ -91,8 +104,8 @@ def _run_jwt_mode(
                 report.breaches.append(outcome)
                 if config.fuzz.stop_on_first_breach:
                     break
-            elif outcome is _SKIPPED:
-                report.skipped += 1
+            elif isinstance(outcome, _Skip):
+                report._record_skip(outcome)
     return report
 
 
@@ -117,12 +130,9 @@ def _run_function_mode(
                         report.breaches.append(outcome)
                         if config.fuzz.stop_on_first_breach:
                             return report
-                    elif outcome is _SKIPPED:
-                        report.skipped += 1
+                    elif isinstance(outcome, _Skip):
+                        report._record_skip(outcome)
     return report
-
-
-_SKIPPED = object()
 
 
 def _probe_jwt(
@@ -132,13 +142,13 @@ def _probe_jwt(
     target: SeededTenant,
     config: Config,
     introspection: IntrospectionResult,
-) -> Breach | None | object:
+) -> Breach | None | _Skip:
     qualified = f'"{cell.schema}"."{cell.table}"'
     tenant_col = config.tenancy.tenant_column
     target_rows = target.rows(cell.schema, cell.table)
 
     if cell.operation in ("UPDATE", "DELETE") and not target_rows:
-        return _SKIPPED
+        return _Skip("no target row on this table")
 
     try:
         conn.rollback()
@@ -157,7 +167,7 @@ def _probe_jwt(
     except psycopg.errors.InsufficientPrivilege:
         return None
     except psycopg.Error:
-        return _SKIPPED
+        return _Skip("probe raised a database error")
     finally:
         conn.rollback()
 
@@ -185,7 +195,7 @@ def _do_insert(
     qualified: str,
     tenant_col: str,
     introspection: IntrospectionResult,
-) -> Breach | None | object:
+) -> Breach | None | _Skip:
     """INSERT a row stamped with target.tenant_id, filling every required col.
 
     A probe that violates a NOT NULL on some unrelated column would always
@@ -208,7 +218,7 @@ def _do_insert(
         insert_vals.append(synth_value(column.type_name, enum_labels=enum_labels))
 
     if not insert_cols:
-        return _SKIPPED
+        return _Skip("no insertable columns")
 
     cols_sql = ", ".join(f'"{c}"' for c in insert_cols)
     placeholders = ", ".join(["%s"] * len(insert_vals))
@@ -228,7 +238,7 @@ def _do_update(
     target: SeededTenant,
     row: SeededRow,
     qualified: str,
-) -> Breach | None | object:
+) -> Breach | None | _Skip:
     """UPDATE the target's row by PK with a no-op self-assignment.
 
     `SET <pk> = <pk>` is a write at the RLS layer (so the policy fires) but
@@ -236,7 +246,7 @@ def _do_update(
     end up rolling back.
     """
     if not row.pk_columns:
-        return _SKIPPED
+        return _Skip("table has no primary key")
     set_clause = ", ".join(f'"{c}" = "{c}"' for c in row.pk_columns)
     where = " AND ".join(f'"{c}" = %s' for c in row.pk_columns)
     values = [row.pk_value(c) for c in row.pk_columns]
@@ -256,9 +266,9 @@ def _do_delete(
     target: SeededTenant,
     row: SeededRow,
     qualified: str,
-) -> Breach | None | object:
+) -> Breach | None | _Skip:
     if not row.pk_columns:
-        return _SKIPPED
+        return _Skip("table has no primary key")
     where = " AND ".join(f'"{c}" = %s' for c in row.pk_columns)
     values = [row.pk_value(c) for c in row.pk_columns]
     cur.execute(f"DELETE FROM {qualified} WHERE {where}", values)
@@ -325,7 +335,7 @@ def _probe_function(
     actor: SeededTenant,
     target: SeededTenant,
     row: SeededRow,
-) -> Breach | None | object:
+) -> Breach | None | _Skip:
     """Call the configured access_function with (actor, target_row) and assert false.
 
     The access_function expression in rlsgrid.toml uses `{name}` placeholders
@@ -336,7 +346,7 @@ def _probe_function(
     template = config.tenancy.access_function or ""
     resolved = _resolve_placeholders(template, actor=actor, target=target, row=row)
     if resolved is None:
-        return _SKIPPED
+        return _Skip("access_function placeholders unresolved")
     sql_fragment, values = resolved
 
     try:
@@ -346,7 +356,7 @@ def _probe_function(
             result = cur.fetchone()
             allowed = bool(result and result[0])
     except psycopg.Error:
-        return _SKIPPED
+        return _Skip("access_function raised a database error")
     finally:
         conn.rollback()
 

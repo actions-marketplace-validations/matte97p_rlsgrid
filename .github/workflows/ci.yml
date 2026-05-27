@@ -38,7 +38,10 @@ jobs:
       - name: Lint
         run: ruff check src tests
       - name: Unit tests
-        run: pytest -q
+        # DB-backed paths are covered by the live smoke + pgtap jobs; the
+        # unit floor here just guards against a catastrophic drop in the
+        # pure-logic modules.
+        run: pytest -q --cov=rlsgrid --cov-report=term-missing --cov-fail-under=50
       - name: Smoke test CLI against live Postgres
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rlsgrid_test
@@ -74,6 +77,43 @@ jobs:
           ! grep -q 'SET ctid' /tmp/mt-gen.sql
           rlsgrid fuzz --config examples/multitenant/rlsgrid.toml --tenants 3
           rlsgrid teardown --config examples/multitenant/rlsgrid.toml --state /tmp/mt-seed.json
+
+  pgtap:
+    # Generate the pgTAP suite against the rich schema and actually run it
+    # with pg_prove, so "rlsgrid emits a passing pgTAP suite" is proven in CI.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install rlsgrid
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Install Postgres 16, pgTAP and pg_prove
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-16 postgresql-16-pgtap libtap-parser-sourcehandler-pgtap-perl
+      - name: Start Postgres + prepare database
+        run: |
+          sudo pg_ctlcluster 16 main start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb rlsgrid_pgtap
+          psql "postgresql://postgres:postgres@localhost:5432/rlsgrid_pgtap" -f examples/multitenant/schema.sql
+          psql "postgresql://postgres:postgres@localhost:5432/rlsgrid_pgtap" -c "CREATE EXTENSION pgtap;"
+      - name: Generate and run the pgTAP suite
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rlsgrid_pgtap
+          PGPASSWORD: postgres
+        run: |
+          rlsgrid seed --config examples/multitenant/rlsgrid.toml --tenants 3 --state-out /tmp/seed.json
+          rlsgrid gen pgtap --config examples/multitenant/rlsgrid.toml --from-state /tmp/seed.json --out /tmp/suite.sql
+          pg_prove -d rlsgrid_pgtap -h localhost -U postgres /tmp/suite.sql
 
   action-smoke:
     runs-on: ubuntu-latest

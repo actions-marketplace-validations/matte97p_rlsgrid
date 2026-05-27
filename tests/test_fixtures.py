@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rlsgrid.fixtures import topological_sort
+from rlsgrid.fixtures import _detect_tenant_root, topological_sort
 from rlsgrid.introspect import ForeignKeyInfo, IntrospectionResult, TableInfo
 
 
@@ -50,6 +50,51 @@ def test_topological_sort_ignores_external_fks() -> None:
     )
     ordered = topological_sort(tables, intro)
     assert [t.name for t in ordered] == ["posts"]
+
+
+def test_detect_tenant_root_follows_fk() -> None:
+    # projects.org_id → orgs.id : the root is (public, orgs, id)
+    intro = IntrospectionResult(
+        foreign_keys=[
+            ForeignKeyInfo(
+                schema="public",
+                table="projects",
+                column="org_id",
+                ref_schema="public",
+                ref_table="orgs",
+                ref_column="id",
+            )
+        ]
+    )
+    assert _detect_tenant_root(intro, "org_id") == ("public", "orgs", "id")
+
+
+def test_detect_tenant_root_none_when_freestanding() -> None:
+    # author_id is a plain value with no FK (the blog pattern).
+    intro = IntrospectionResult(foreign_keys=[])
+    assert _detect_tenant_root(intro, "author_id") is None
+
+
+def test_topological_sort_across_schemas() -> None:
+    tables = [
+        TableInfo(schema="app", name="child", rls_enabled=True, rls_forced=False),
+        TableInfo(schema="core", name="parent", rls_enabled=True, rls_forced=False),
+    ]
+    intro = IntrospectionResult(
+        tables=tables,
+        foreign_keys=[
+            ForeignKeyInfo(
+                schema="app",
+                table="child",
+                column="parent_id",
+                ref_schema="core",
+                ref_table="parent",
+                ref_column="id",
+            )
+        ],
+    )
+    ordered = [f"{t.schema}.{t.name}" for t in topological_sort(tables, intro)]
+    assert ordered.index("core.parent") < ordered.index("app.child")
 
 
 def test_topological_sort_ignores_self_reference() -> None:
