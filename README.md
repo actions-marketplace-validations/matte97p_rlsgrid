@@ -5,6 +5,8 @@ before your users do.**
 
 [![CI](https://github.com/matte97p/rlsgrid/actions/workflows/ci.yml/badge.svg)](https://github.com/matte97p/rlsgrid/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rlsgrid.svg)](https://pypi.org/project/rlsgrid/)
+[![Downloads](https://img.shields.io/pypi/dm/rlsgrid.svg)](https://pypistats.org/packages/rlsgrid)
+[![GitHub stars](https://img.shields.io/github/stars/matte97p/rlsgrid?style=flat&logo=github)](https://github.com/matte97p/rlsgrid/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -34,10 +36,15 @@ not the policies. rlsgrid tests the policies, against a real database.
 ## Use it
 
 ```bash
+sudo apt install python3-venv -y
+python3 -m venv ~/venvs/rlsgrid-env
+source ~/venvs/rlsgrid-env/bin/activate
 pip install rlsgrid
-
+# if ipv6
 export DATABASE_URL=postgresql://user:pw@host/db   # use staging, never prod
-
+# if ipv4
+getent ahosts db-host | grep STREAM | grep 4
+export DATABASE_URL=postgresql://user:pw@<response>/db
 rlsgrid init --from-db      # read the schema, write an annotated config
 rlsgrid check --tenants 5   # seed → fuzz → teardown. exit 1 on any leak.
 ```
@@ -56,7 +63,7 @@ breach, so it drops straight into CI. A leak looks like:
 ```yaml
 - uses: matte97p/rlsgrid@v1
   with:
-    command: check
+    command: fuzz   # seeds synthetic tenants, probes isolation, fails the build on any leak
     database-url: ${{ secrets.STAGING_DB_URL }}
 ```
 
@@ -135,3 +142,20 @@ Built by [Matteo Perino](https://github.com/matte97p) while shipping
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Related tools
+
+Part of my open-source toolkit — [github.com/matte97p](https://github.com/matte97p):
+
+- [pentest-framework](https://github.com/matte97p/pentest-framework) — low-noise pentest orchestration, normalized to one schema and rendered to a PDF
+- [demowright](https://github.com/matte97p/demowright) — record polished product-demo videos from a script that lives in your repo
+- [GeoSuite CLIs](https://github.com/TryGeoSuite) — zero-dep Generative Engine Optimization toolkit
+
+---
+
+⭐ If rlsgrid caught a leak (or proved you safe), [give it a star](https://github.com/matte97p/rlsgrid) — it helps other Supabase teams find it.
+
+
+---
+
+<sub>🌐 Built by **Matteo Perino** — [matteoperino.dev](https://matteoperino.dev)</sub>
